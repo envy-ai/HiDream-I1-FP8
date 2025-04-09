@@ -1,3 +1,29 @@
+# HiDream-I1 FP8 proof of concept
+
+This works on my 4090, using around 18 gigs of vram.  It's slow as hell because it's quantizing the models on load, but it's a proof of concept and it works.
+
+This code is garbage.  Google AI Studio and ChatGPT o3-mini-high weren't really up to the task, which I ultimately figured out myself, but because of that the code probably has way more cruft than it should.
+
+Install the requirements with:
+
+pip install -r requirements.txt
+
+Run with:
+
+python inference_torchao.py --prompt "An avocado in the shape of a chair, or something."
+
+or
+
+accelerate launch inference_torchao.py --prompt "A woman lying in the grass."
+
+Things I should do later but probably won't because ComfyUI will support it natively by the time I get around to it:
+
+* Make it load models that are already quantized so it's not so excruciatingly slow to run
+* Figure out some way to swap llama to the CPU rather than unloading it, so it'll be viable to keep everything loaded for multiple inferences
+* Add a --seed command line parameter (this should be easy)
+* Experiment with FP6 and see if I can make it fit under 16 gigs.
+* Fix the stupid --resolution command line parameter. 
+
 # HiDream-I1
 
 ![HiDream-I1 Demo](assets/demo.jpg)
