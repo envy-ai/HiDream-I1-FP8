@@ -5,6 +5,7 @@ import einops
 import inspect
 import logging
 import sys
+import os
 import gc
 import time # Import time for more granular timing if needed
 from typing import Any, Callable, Dict, List, Optional, Union
@@ -56,6 +57,7 @@ try:
         T5EncoderModel,
         T5Tokenizer,
         LlamaForCausalLM,
+        LlamaConfig,
         PreTrainedTokenizerFast
     )
     from diffusers.image_processor import VaeImageProcessor
@@ -94,20 +96,25 @@ else:
     logger.info("Torch XLA is not available.")
 # --- End Diffusers/Transformers Imports ---
 
+# get time in YYYY-MM-DD-HH-MM-SS format
+time_str = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
 
 # --- Argument Parsing and Configs ---
 parser = argparse.ArgumentParser(description="Generate images using HiDream with optional FP8 quantization.")
 parser.add_argument("--model_type", type=str, default="full", choices=["dev", "full", "fast"], help="Specify HiDream model variant.")
-parser.add_argument("--llama_path", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="Path to the Llama model directory.")
-parser.add_argument("--output_file", type=str, default="output_fp8.png", help="Filename for the generated output image.")
+parser.add_argument("--llama_path", type=str, default="RichardErkhov/NaniDAO_-_Meta-Llama-3.1-8B-Instruct-ablated-v1-8bits", help="Huggingface or local path to the Llama model, ideally INT8 quantized as FP8 will not work. Also try the non-ablated model at fsaudm/Meta-Llama-3.1-8B-Instruct-INT8")
+parser.add_argument("--output_file", type=str, default=f"output_fp8_{time_str}.png", help="Filename for the generated output image.")
 parser.add_argument("--prompt", type=str, default="A majestic rainbow-colored llama surfing on a cosmic wave, digital art, high detail.", help="Text prompt for image generation.")
+parser.add_argument("--negative_prompt", type=str, default="", help="Negative text prompt for image generation.")
 parser.add_argument("--resolution", type=str, default="1024x1024", help="Target image resolution (1024x1024 by default).")
 parser.add_argument("--seed", type=int, default=12345, help="Seed for random number generator. Use -1 for random.")
+parser.add_argument("--unload_transformer", action="store_true", help="Unload transformer after encoding.")
 args = parser.parse_args()
 
 model_type = args.model_type
 # quantize_enabled depends on both the flag AND successful torchao/TorchAoConfig import
 quantize_enabled = True
+unload_transformer = args.unload_transformer
 LLAMA_MODEL_NAME = args.llama_path
 OUTPUT_FILENAME = args.output_file
 # --- End Argument Parsing ---
@@ -236,6 +243,7 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 128,
     ):
+        
         logger.info("--- Entering Pipeline __call__ ---")
         # --- Start Memory Management & Setup ---
         start_call_time = time.time()
@@ -244,26 +252,28 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
 
         # Resolution scaling logic (as in original pipeline)
         division = self.vae_scale_factor * 2 # Patch size * VAE factor
-        default_pixel_height = self.default_sample_size * self.vae_scale_factor
-        default_pixel_width = self.default_sample_size * self.vae_scale_factor
-        S_max = default_pixel_height * default_pixel_width
+        # default_pixel_height = self.default_sample_size * self.vae_scale_factor
+        # default_pixel_width = self.default_sample_size * self.vae_scale_factor
+        # S_max = default_pixel_height * default_pixel_width
 
-        if width * height == 0:
-            logger.warning(f"Input width or height is zero ({width=}, {height=}). Resetting to default.")
-            width = default_pixel_width
-            height = default_pixel_height
+        # if width * height == 0:
+        #     logger.warning(f"Input width or height is zero ({width=}, {height=}). Resetting to default.")
+        #     width = default_pixel_width
+        #     height = default_pixel_height
 
-        scale = math.sqrt(S_max / (width * height))
-        target_h = int(height * scale)
-        target_w = int(width * scale)
-        height = (target_h // division) * division
-        width = (target_w // division) * division
-        if height == 0 or width == 0:
-             logger.warning(f"Calculated zero dimension after scaling ({width=}, {height=}). Check input resolution and VAE scale factor. Resetting to default.")
-             height = default_pixel_height
-             width = default_pixel_width
-        logger.info(f"Pipeline calculating image size: {width}x{height} (after scaling/alignment)")
+        # scale = math.sqrt(S_max / (width * height))
+        # target_h = int(height * scale)
+        # target_w = int(width * scale)
+        # height = (target_h // division) * division
+        # width = (target_w // division) * division
+        # if height == 0 or width == 0:
+        #      logger.warning(f"Calculated zero dimension after scaling ({width=}, {height=}). Check input resolution and VAE scale factor. Resetting to default.")
+        #      height = default_pixel_height
+        #      width = default_pixel_width
+        # logger.info(f"Pipeline calculating image size: {width}x{height} (after scaling/alignment)")
 
+        height = (height // division) * division
+        width = (width // division) * division
 
         self._guidance_scale = guidance_scale
         self._joint_attention_kwargs = joint_attention_kwargs
@@ -349,6 +359,17 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
             )
             prompt_embeds_list, negative_prompt_embeds_list, pooled_prompt_embeds_out, negative_pooled_prompt_embeds_out = prompt_embeds_tuple
             logger.info("Prompt encoding calculation complete.")
+            
+            # Cast all prompt embeds to BFloat16
+            if prompt_embeds_list is not None:
+                prompt_embeds_list = [p.to(torch.bfloat16) for p in prompt_embeds_list]
+            if negative_prompt_embeds_list is not None:
+                negative_prompt_embeds_list = [n.to(torch.bfloat16) for n in negative_prompt_embeds_list]
+            if pooled_prompt_embeds_out is not None:
+                pooled_prompt_embeds_out = pooled_prompt_embeds_out.to(torch.bfloat16)
+            if negative_pooled_prompt_embeds_out is not None:
+                negative_pooled_prompt_embeds_out = negative_pooled_prompt_embeds_out.to(torch.bfloat16)
+                
 
             # Combine for CFG if enabled
             if do_classifier_free_guidance:
@@ -652,6 +673,18 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
                 if torch.cuda.is_available():
                     logger.info(f"CUDA memory allocated before VAE decode: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
                     logger.info(f"CUDA memory reserved before VAE decode: {torch.cuda.memory_reserved(device) / 1e9:.2f} GB")
+                    
+                if unload_transformer:
+                    self.transformer = None
+                    logger.info("Transformer unloaded.")
+                    # Clear cache, etc
+                    if torch.cuda.is_available():
+                        logger.info("Clearing CUDA cache...")
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        torch.cuda.ipc_collect()
+                        logger.info(f"CUDA memory allocated after clearing cache: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
+                        logger.info(f"CUDA memory reserved after clearing cache: {torch.cuda.memory_reserved(device) / 1e9:.2f} GB")
 
                 image = self.vae.decode(latents, return_dict=False)[0]
 
@@ -894,56 +927,133 @@ def load_models(model_type, load_transformer, quantize=False):
         # We'll keep it unloaded for now as per the original logic, but log clearly.
         start_time = time.time()
         logger.info(f"Loading Text Encoder 4 (Llama) from {LLAMA_MODEL_NAME} to CPU without explicit quantization config...")
-        try:
-            text_encoder_4 = LlamaForCausalLM.from_pretrained(
-                LLAMA_MODEL_NAME,
-                output_hidden_states=True,
-                output_attentions=True,
-                torch_dtype=dtype,
-                #low_cpu_mem_usage=True,
-                load_in_8bit=True,             # This activates 8-bit quantization
-                device_map="auto",             # Optionally, let the model be mapped appropriately
-                #quantization_config=TorchAoConfig(fp8_quant_type)
-            )#.to("cpu")
-            logger.info(f"Text Encoder 4 (Llama) loaded to CPU in {time.time() - start_time:.2f}s.")
-        except OSError:
-            logger.error(f"Cannot find Llama model files at '{LLAMA_MODEL_NAME}'. Please check the path.")
-            raise
-        except Exception as e:
-            logger.error(f"Error loading Llama model: {e}", exc_info=True)
-            raise
+
+        # cache_dir = "model_cache"
+        # os.makedirs(cache_dir, exist_ok=True)
+        # cache_file = os.path.join(cache_dir, f"llama_int8.safetensors")
+        
+        # if not os.path.exists(cache_file):
+        #     logger.info(f"Cached quantized Llama text encoder at {cache_file} not found... Loading and quantizing...")
+        text_encoder_4 = LlamaForCausalLM.from_pretrained(
+            LLAMA_MODEL_NAME, 
+            output_hidden_states=True,
+            output_attentions=True,
+            torch_dtype=dtype,
+            #load_in_8bit=True,             # This activates 8-bit quantization
+            device_map="auto",
+        )
+            
+            #torch.save(text_encoder_4.state_dict(), cache_file)
+        #else:
+            #logger.info(f"Loading quantized Llama text encoder from cache at {cache_file}...")
+            #with torch.device("cuda"):  
+            # if True:  
+            #     # llama_config = LlamaConfig.from_pretrained(LLAMA_MODEL_NAME)
+            #     # # Instantiate a new model from the configuration.
+            #     # text_encoder_4 = LlamaForCausalLM(config).eval().to(torch.bfloat16)
+            #     # state_dict = torch.load(cache_file)
+            #     # text_encoder_4.load_state_dict(state_dict, assign=True)
+                
+            #     # Load configuration and instantiate an empty model
+            #     llama_config = LlamaConfig.from_pretrained(LLAMA_MODEL_NAME)
+            #     text_encoder_4 = LlamaForCausalLM(llama_config).eval().to(torch.bfloat16)
+                
+            #     # Load the state dict from cache
+            #     state_dict = torch.load(cache_file, weights_only=True)
+            #     # Filter extra quantization keys
+            #     filtered_state_dict = {
+            #         k: v for k, v in state_dict.items() 
+            #         if (".SCB" not in k and "weight_format" not in k)
+            #     }
+            #     # Optionally, disable gradient requirements on non-floating tensors
+            #     for k, v in filtered_state_dict.items():
+            #         if not (v.dtype.is_floating_point or v.dtype.is_complex):
+            #             v.requires_grad = False
+
+            #     # Load the filtered state dictionary with strict=False
+            #     missing, unexpected = text_encoder_4.load_state_dict(filtered_state_dict, strict=False)
+            #     if unexpected:
+            #         logger.warning(f"Unexpected keys during load: {unexpected}")
+            #     if missing:
+            #         logger.warning(f"Missing keys during load: {missing}")
+
+        
+        
+        # try:
+        #     text_encoder_4 = LlamaForCausalLM.from_pretrained(
+        #         LLAMA_MODEL_NAME,
+        #         output_hidden_states=True,
+        #         output_attentions=True,
+        #         torch_dtype=dtype,
+        #         #low_cpu_mem_usage=True,
+        #         load_in_8bit=True,             # This activates 8-bit quantization
+        #         device_map="auto",             # Optionally, let the model be mapped appropriately
+        #         #quantization_config=TorchAoConfig(fp8_quant_type)
+        #     )#.to("cpu")
+        #     logger.info(f"Text Encoder 4 (Llama) loaded to CPU in {time.time() - start_time:.2f}s.")
+        # except OSError:
+        #     logger.error(f"Cannot find Llama model files at '{LLAMA_MODEL_NAME}'. Please check the path.")
+        #     raise
+        # except Exception as e:
+        #     logger.error(f"Error loading Llama model: {e}", exc_info=True)
+        #     raise
     else:
-        # Load Transformer last (potentially largest and subject to TorchAo quantization)
         start_time = time.time()
         logger.info(f"--- Loading Transformer to CPU {transformer_quant_status} ---")
-        try:
-            # Log GPU ram usage
-            if torch.cuda.is_available():
-                logger.info(f"CUDA memory allocated before loading transformer: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
-                logger.info(f"CUDA memory reserved before loading transformer: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
-                
+
+        cache_dir = "model_cache"
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_file = os.path.join(cache_dir, f"transformer_{fp8_quant_type}.safetensors")
+        
+        if not os.path.exists(cache_file):
+            logger.info(f"Cached quantized transformer at {cache_file} not found... Loading and quantizing...")
             transformer = HiDreamImageTransformer2DModel.from_pretrained(
-                pretrained_model_name_or_path,
-                subfolder="transformer",
-                torch_dtype=dtype,
-                quantization_config=quantization_config # Pass the TorchAoConfig here!
-            )
-            logger.info(f"Transformer loaded to CPU in {time.time() - start_time:.2f}s.")
-            # Log GPU ram usage
-            if torch.cuda.is_available():
-                logger.info(f"CUDA memory allocated after loading transformer: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
-                logger.info(f"CUDA memory reserved after loading transformer: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
+                "HiDream-ai/HiDream-I1-Dev", 
+                subfolder="transformer", 
+                torch_dtype=torch.bfloat16,
+                quantization_config=TorchAoConfig("float8wo_e4m3")).to("cuda")
             
-            if quantization_config:
-                logger.info("TorchAo quantization should be applied to the Transformer during loading.")
-                # You might need further checks here to confirm quantization actually happened,
-                # e.g., by inspecting layer types or checking for specific attributes added by torchao.
-            
-            return transformer
-          
-        except Exception as e:
-            logger.error(f"Error loading Transformer model: {e}", exc_info=True)
-            raise
+            torch.save(transformer.state_dict(), cache_file)
+        else:
+            logger.info(f"Loading quantized transformer from cache at {cache_file}...")
+            with torch.device("meta"):
+                transformer = HiDreamImageTransformer2DModel.from_config("HiDream-ai/HiDream-I1-Dev", subfolder="transformer").eval().to(torch.bfloat16)
+                state_dict = torch.load(cache_file)
+                transformer.load_state_dict(state_dict, assign=True)
+
+        # if os.path.exists(cache_file):
+        #     logger.info(f"Cached quantized transformer found at {cache_file}. Loading from cache...")
+        #     transformer = HiDreamImageTransformer2DModel.from_pretrained(
+        #         pretrained_model_name_or_path,
+        #         subfolder="transformer",
+        #         torch_dtype=dtype,
+        #     )
+        #     state_dict = torch.load(cache_file)
+        #     transformer.load_state_dict(state_dict)
+        #     logger.info("Transformer loaded from cached safetensors file.")
+        # else:
+        #     logger.info("No cached transformer found. Loading and applying quantization via TorchAoConfig...")
+        #     transformer = HiDreamImageTransformer2DModel.from_pretrained(
+        #         pretrained_model_name_or_path,
+        #         subfolder="transformer",
+        #         torch_dtype=dtype,
+        #         quantization_config=quantization_config
+        #     )
+            # Ensure the model is on CPU and clone its parameters to have valid storage.
+            #transformer.to("cpu")
+            # Create a state dict with valid CPU tensors.
+            #state_dict = {k: v.detach().cpu().clone().contiguous() for k, v in transformer.state_dict().items()}
+            # Save the state dict using torch.save.
+           # torch.save(state_dict, cache_file)
+            #logger.info(f"Quantized transformer saved to cache at {cache_file}.")
+            #transformer.to("cuda")
+
+        logger.info(f"Transformer loaded to CPU in {time.time() - start_time:.2f}s.")
+        return transformer
+
+        # except Exception as e:
+        #     logger.error(f"Error loading Transformer model: {e}", exc_info=True)
+        #     raise
 
     # --- Scheduler Setup ---
     start_time = time.time()
@@ -1034,6 +1144,7 @@ if __name__ == "__main__":
 
     # Generation parameters from args and config
     prompt = args.prompt
+    negative_prompt = args.negative_prompt
     resolution_str = args.resolution
     seed = args.seed
     guidance_scale = model_specific_config["guidance_scale"]
@@ -1074,6 +1185,10 @@ if __name__ == "__main__":
 
         image_output = pipe(
             prompt=prompt,
+            negative_prompt=negative_prompt,
+            negative_prompt_2=negative_prompt,
+            negative_prompt_3=negative_prompt,
+            negative_prompt_4=negative_prompt,
             height=height,
             width=width,
             guidance_scale=guidance_scale,
