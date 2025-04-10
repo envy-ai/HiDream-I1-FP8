@@ -1003,7 +1003,7 @@ def load_models(model_type, load_transformer, quantize=False):
 
         cache_dir = "model_cache"
         os.makedirs(cache_dir, exist_ok=True)
-        cache_file = os.path.join(cache_dir, f"transformer_{fp8_quant_type}.safetensors")
+        cache_file = os.path.join(cache_dir, f"transformer_{model_type}.safetensors")
         
         if not os.path.exists(cache_file):
             logger.info(f"Cached quantized transformer at {cache_file} not found... Loading and quantizing...")
