@@ -100,12 +100,8 @@ parser = argparse.ArgumentParser(description="Generate images using HiDream with
 parser.add_argument("--model_type", type=str, default="full", choices=["dev", "full", "fast"], help="Specify HiDream model variant.")
 parser.add_argument("--llama_path", type=str, default="meta-llama/Llama-3.1-8B-Instruct", help="Path to the Llama model directory.")
 parser.add_argument("--output_file", type=str, default="output_fp8.png", help="Filename for the generated output image.")
-parser.add_argument("--prompt", type=str, default="Professional studio photograph of a woman lying in the grass during the Golden Hour", help="Text prompt for image generation.")
-parser.add_argument("--resolution", type=str, default="1024 × 1024 (Square)", choices=[
-    "1024 × 1024 (Square)", "768 × 1360 (Portrait)", "1360 × 768 (Landscape)",
-    "880 × 1168 (Portrait)", "1168 × 880 (Landscape)", "1248 × 832 (Landscape)",
-    "832 × 1248 (Portrait)"
-], help="Target image resolution.")
+parser.add_argument("--prompt", type=str, default="A majestic rainbow-colored llama surfing on a cosmic wave, digital art, high detail.", help="Text prompt for image generation.")
+parser.add_argument("--resolution", type=str, default="1024x1024", help="Target image resolution (1024x1024 by default).")
 parser.add_argument("--seed", type=int, default=12345, help="Seed for random number generator. Use -1 for random.")
 args = parser.parse_args()
 
@@ -183,11 +179,13 @@ def retrieve_timesteps(
     return timesteps, num_inference_steps
 
 def parse_resolution(resolution_str):
-    """Parses resolution string like '1024 × 1024 (Square)' into (height, width)."""
+    """Parses resolution string like '1024×1024' into (height, width)."""
     try:
-        parts = resolution_str.split('(')[0].strip().split('×')
-        width = int(parts[0].strip())
-        height = int(parts[1].strip())
+        # Normalize resolution string to remove non-standard characters
+        resolution_str = resolution_str.replace("×", "x").replace(" ", "").replace("(", "").replace(")", "")
+        # Split by 'x' and convert to integers
+        width, height = map(int, resolution_str.split("x"))
+
         # HiDream pipeline expects (height, width)
         # The resolution strings seem to be WxH format.
         # Let's return (height, width) as expected by the pipeline's prepare_latents.
