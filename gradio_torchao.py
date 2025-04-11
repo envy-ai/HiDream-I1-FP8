@@ -83,11 +83,9 @@ parser.add_argument("--llama_path", type=str, default="RichardErkhov/NaniDAO_-_M
 parser.add_argument("--quantize_llama", action="store_true", help="Quantize llama when loading, in case you're loading a non-quantized model.")
 parser.add_argument("--listen", action="store_true", help="Open to LAN (run on 0.0.0.0).")
 parser.add_argument("--port", type=int, default=7860, help="Port for Gradio server.")
-parser.add_argument("--negative_prompt_scale", type=float, default=1.0, help="Scale for negative prompt.")
 args = parser.parse_args()
 
 # quantize_enabled depends on both the flag AND successful torchao/TorchAoConfig import
-negative_prompt_scale = args.negative_prompt_scale
 quantize_enabled = True
 quantize_llama = args.quantize_llama
 listen = args.listen
@@ -180,6 +178,7 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
                  negative_prompt_2: Optional[Union[str, List[str]]] = None,
                  negative_prompt_3: Optional[Union[str, List[str]]] = None,
                  negative_prompt_4: Optional[Union[str, List[str]]] = None,
+                 negative_prompt_scale: float = 1.0,
                  num_images_per_prompt: Optional[int] = 1,
                  generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
                  latents: Optional[torch.FloatTensor] = None,
@@ -258,18 +257,43 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
                 pooled_prompt_embeds_out = pooled_prompt_embeds_out.to(torch.bfloat16)
             if negative_pooled_prompt_embeds_out is not None:
                 negative_pooled_prompt_embeds_out = negative_pooled_prompt_embeds_out.to(torch.bfloat16)
+                
+            # Multiply all negative prompts by negative_prompt_scale
+            if negative_prompt_scale != 1 and do_classifier_free_guidance:
+                # Get an embedding of a blank negative prompt
+                prompt_embeds_tuple_temp = self.encode_prompt(
+                    prompt="", prompt_2="", prompt_3="", prompt_4="",
+                    negative_prompt="", negative_prompt_2="", negative_prompt_3="", negative_prompt_4="",
+                    do_classifier_free_guidance=do_classifier_free_guidance,
+                    device=text_encoder_device,
+                    num_images_per_prompt=num_images_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                )
+                _, blank_negative_prompt_embeds_list, _, blank_negative_pooled_prompt_embeds_out = prompt_embeds_tuple_temp
+              
+              
+                logger.info(f"Scaling negative prompt embeddings by {negative_prompt_scale}...")                
+                # Iterate through negative prompt embeddings and scale them
+                for i, n in enumerate(negative_prompt_embeds_list):
+                    blank_n = blank_negative_prompt_embeds_list[i]
+                    negative_prompt_embeds_list[i] = n * negative_prompt_scale + (1 - negative_prompt_scale) * blank_n
+ 
+                # negative_prompt_embeds_list = [
+                #     n * negative_prompt_scale + (1 - negative_prompt_scale) * blank_n
+                #     for n in negative_prompt_embeds_list
+                # ]
+                negative_pooled_prompt_embeds_out = (
+                    negative_pooled_prompt_embeds_out * negative_prompt_scale + blank_negative_pooled_prompt_embeds_out * (1 - negative_prompt_scale)
+                ) if negative_pooled_prompt_embeds_out is not None else None
+            else:
+                logger.info("No scaling applied to negative prompt embeddings.")
+                
             if do_classifier_free_guidance:
                 logger.info("Performing Classifier-Free Guidance embedding concatenation...")
                 final_prompt_embeds_components = []
                 if negative_prompt_embeds_list is None:
                     raise ValueError("Negative prompt embeddings required for CFG but not provided.")
-
-                # Multiply all negative prompts by negative_prompt_scale
-                if negative_prompt_scale != 1:
-                    negative_prompt_embeds_list = [
-                        n * negative_prompt_scale for n in negative_prompt_embeds_list
-                    ]
-                    
+        
                 for i, (neg, pos) in enumerate(zip(negative_prompt_embeds_list, prompt_embeds_list)):
                     if len(neg.shape) == 4:
                         final_prompt_embeds_components.append(torch.cat([neg, pos], dim=1))
@@ -280,9 +304,35 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
                 
                 final_prompt_embeds = final_prompt_embeds_components
                 final_pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds_out, pooled_prompt_embeds_out], dim=0)
-            else:
+            else:            
                 final_prompt_embeds = prompt_embeds_list
                 final_pooled_prompt_embeds = pooled_prompt_embeds_out
+                if negative_prompt != "":
+                    # Get an embedding of a blank negative prompt
+                    logger.info(f"Negative prompt: {negative_prompt} at scale {negative_prompt_scale}...")                    
+                    prompt_embeds_tuple_temp = self.encode_prompt(
+                        prompt="", prompt_2="", prompt_3="", prompt_4="",
+                        negative_prompt="", negative_prompt_2="", negative_prompt_3="", negative_prompt_4="",
+                        do_classifier_free_guidance=do_classifier_free_guidance,
+                        device=text_encoder_device,
+                        num_images_per_prompt=num_images_per_prompt,
+                        max_sequence_length=max_sequence_length,
+                    )
+                    _, blank_negative_prompt_embeds_list, _, blank_negative_pooled_prompt_embeds_out = prompt_embeds_tuple_temp
+                    
+                    # Subtract empty negative prompt embeddings from the actual negative prompt embeddings
+                    for i, n in enumerate(negative_prompt_embeds_list):
+                        blank_n = blank_negative_prompt_embeds_list[i]
+                        negative_prompt_embeds_list[i] = (n - blank_n) * negative_prompt_scale
+                    negative_pooled_prompt_embeds_out = (
+                        negative_pooled_prompt_embeds_out - blank_negative_pooled_prompt_embeds_out) * negative_prompt_scale if negative_pooled_prompt_embeds_out is not None else None
+                    
+                    logger.info("Combining negative and positive prompt embeddings...")
+                    final_prompt_embeds = []
+                    for i, (neg, pos) in enumerate(zip(negative_prompt_embeds_list, prompt_embeds_list)):
+                        final_prompt_embeds.append(pos - neg)   
+                    final_pooled_prompt_embeds = (pooled_prompt_embeds_out - negative_pooled_prompt_embeds_out) if pooled_prompt_embeds_out is not None else None                                   
+                            
             logger.info("Final prompt embeddings prepared.")
             encode_end_time = time.time()
             logger.info(f"--- Encoding Phase finished in {encode_end_time - encode_start_time:.2f} seconds ---")
@@ -609,7 +659,7 @@ def load_models(model_type, load_transformer, quantize=False):
     logger.info(f"--- Model Loading finished in {time.time() - load_start_time:.2f} seconds ---")
     return pipe, config
 
-def inference_worker(prompt: str, negative_prompt: str, resolution: str, seed: int, model_type: str):
+def inference_worker(prompt: str, negative_prompt: str, negative_prompt_scale: float, resolution: str, seed: int, model_type: str):
     """
     Runs inference in a child process so that GPU memory is freed after each request.
     Loads the pipeline, runs image generation, and returns the generated image as PNG bytes.
@@ -629,9 +679,7 @@ def inference_worker(prompt: str, negative_prompt: str, resolution: str, seed: i
     image_output = pipe(
         prompt=prompt,
         negative_prompt=negative_prompt,
-        negative_prompt_2=negative_prompt,
-        negative_prompt_3=negative_prompt,
-        negative_prompt_4=negative_prompt,
+        negative_prompt_scale=negative_prompt_scale,
         height=height,
         width=width,
         guidance_scale=config["guidance_scale"],
@@ -664,11 +712,11 @@ def inference_worker(prompt: str, negative_prompt: str, resolution: str, seed: i
     return buf.getvalue()
 
   
-def gradio_generate(prompt: str, negative_prompt: str, resolution: str, seed: int, model_type: str):
+def gradio_generate(prompt: str, negative_prompt: str, negative_prompt_scale: float, resolution: str, seed: int, model_type: str):
     """
     Gradio generation function runs inference in the main process.
     """
-    image_bytes = inference_worker(prompt, negative_prompt, resolution, seed, model_type)
+    image_bytes = inference_worker(prompt, negative_prompt, negative_prompt_scale, resolution, seed, model_type)
     from io import BytesIO
     from PIL import Image
     image = Image.open(BytesIO(image_bytes))
@@ -680,6 +728,7 @@ iface = gr.Interface(
     inputs=[
         gr.Textbox(lines=2, label="Prompt", placeholder="Enter your prompt here..."),
         gr.Textbox(lines=2, label="Negative Prompt", placeholder="Optional negative prompt..."),
+        gr.Number(label="Negative Prompt Scale", value=1.0, step=0.05),
         gr.Textbox(lines=1, label="Resolution", value="1024x1024"),
         gr.Number(label="Seed (-1 for random)", value=-1),
         gr.Dropdown(choices=["dev", "full", "fast"], label="Model Type", value="full")
@@ -694,4 +743,4 @@ if __name__ == "__main__":
         iface.launch(server_name="0.0.0.0", server_port=listen_port)
     else:
         iface.launch(server_port=listen_port)
-    logger.info("Gradio interface launched.")
+
