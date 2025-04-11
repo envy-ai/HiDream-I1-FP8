@@ -1,4 +1,20 @@
-# HiDream-I1 FP8 proof of concept
+# HiDream-I1 FP8
+
+## UPDATE 4/11/2025
+
+Lots of changes here.  First off, I've cleaned up the code and added caching of the quantized transformer so that it's only really slow on the first run in a given mode (full, dev, or fast). On subsequent runs, the quantized transformer will be loaded from disk.  Also, I've changed the llama model location so that it links to an ablated, pre-quantized version, which loads significantly faster.
+
+I've added a gradio interface.  After installing with:
+
+    pip install -r requirements.txt
+
+run with:
+
+    python gradio_torchao.py
+
+Like the command line version, the gradio interface caches the transformer and will run faster on subsequent prompts, particularly if you keep using the same mode rather than switching.  It also comes with a "negative prompt scale" parameter that allows you to adjust the strength of the negative prompt. Negative prompts even work on the CFG-free dev and fast models because I've figured out a trick to combine the positive and negative embeddings with subtraction rather than concatenation, although the negative prompt acts a bit differently for dev and fast, so you'll want to do some experimentation.
+
+## Original HiDream-I1 FP8 readme
 
 This works on my 4090, using around 18 gigs of vram.  It's slow as hell because it's quantizing the models on load, but it's a proof of concept and it works.
 
