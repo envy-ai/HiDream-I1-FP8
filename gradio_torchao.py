@@ -1,4 +1,5 @@
 import torch
+import argparse
 import math
 import einops
 import inspect
@@ -71,10 +72,23 @@ if is_torch_xla_available():
 else:
     XLA_AVAILABLE = False
     logger.info("Torch XLA is not available.")
+    
+parser = argparse.ArgumentParser(description="Generate images using HiDream with optional FP8 quantization.")
+parser.add_argument("--llama_path", type=str, default="RichardErkhov/NaniDAO_-_Meta-Llama-3.1-8B-Instruct-ablated-v1-8bits", help="Huggingface or local path to the Llama model, ideally INT8 quantized as FP8 will not work. Also try the non-ablated model at fsaudm/Meta-Llama-3.1-8B-Instruct-INT8")
+parser.add_argument("--quantize_llama", action="store_true", help="Quantize llama when loading, in case you're loading a non-quantized model.")
+parser.add_argument("--listen", action="store_true", help="Open to LAN (run on 0.0.0.0).")
+parser.add_argument("--port", type=int, default=7860, help="Port for Gradio server.")
+args = parser.parse_args()
+
+# quantize_enabled depends on both the flag AND successful torchao/TorchAoConfig import
+quantize_enabled = True
+quantize_llama = args.quantize_llama
+listen = args.listen
+listen_port = args.port
+LLAMA_MODEL_NAME = args.llama_path
 
 # --- Global Settings and Model Configurations ---
 time_str = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
-LLAMA_MODEL_NAME = "RichardErkhov/NaniDAO_-_Meta-Llama-3.1-8B-Instruct-ablated-v1-8bits"  # Default Llama model path
 MODEL_PREFIX = "HiDream-ai"  # Local path prefix or model hub prefix
 MODEL_CONFIGS = {
     "dev": {
@@ -314,8 +328,27 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
                 latents = (latents / scaling_factor) + shift_factor
                 if latents.dtype != self.vae.dtype:
                     latents = latents.to(self.vae.dtype)
+                    
+                self.transformer = None
+                logger.info("Transformer unloaded.")
+                # Clear cache, etc
+                logger.info("Clearing CUDA cache...")
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+                logger.info(f"CUDA memory allocated after clearing cache: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
+                logger.info(f"CUDA memory reserved after clearing cache: {torch.cuda.memory_reserved(device) / 1e9:.2f} GB")
                 image = self.vae.decode(latents, return_dict=False)[0]
                 image = self.image_processor.postprocess(image, output_type=output_type)
+                
+                self.vae = None
+                logger.info("VAE unloaded.")
+                logger.info("Clearing CUDA cache...")
+                gc.collect()
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+                logger.info(f"CUDA memory allocated after clearing cache: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
+                logger.info(f"CUDA memory reserved after clearing cache: {torch.cuda.memory_reserved(device) / 1e9:.2f} GB")
             else:
                 image = latents
         except Exception as e:
@@ -457,14 +490,24 @@ def load_models(model_type, load_transformer, quantize=False):
         # We'll keep it unloaded for now as per the original logic, but log clearly.
         start_time = time.time()
         logger.info(f"Loading Text Encoder 4 (Llama) from {LLAMA_MODEL_NAME} without explicit quantization config...")
-
-        text_encoder_4 = LlamaForCausalLM.from_pretrained(
-            LLAMA_MODEL_NAME, 
-            output_hidden_states=True,
-            output_attentions=True,
-            torch_dtype=dtype,
-            device_map="auto",
-        )
+        
+        if quantize_llama:
+            text_encoder_4 = LlamaForCausalLM.from_pretrained(
+                LLAMA_MODEL_NAME, 
+                output_hidden_states=True,
+                output_attentions=True,
+                torch_dtype=dtype,
+                device_map="auto",
+                load_in_8bit=True, 
+            )
+        else:
+            text_encoder_4 = LlamaForCausalLM.from_pretrained(
+                LLAMA_MODEL_NAME, 
+                output_hidden_states=True,
+                output_attentions=True,
+                torch_dtype=dtype,
+                device_map="auto",
+            )
             
             
     else:
@@ -585,14 +628,24 @@ def inference_worker(prompt: str, negative_prompt: str, resolution: str, seed: i
     return buf.getvalue()
 
 # --- Gradio Generation Function ---
+# def gradio_generate(prompt: str, negative_prompt: str, resolution: str, seed: int, model_type: str):
+#     """
+#     Gradio generation function spawns a separate process for inference.
+#     """
+#     ctx = multiprocessing.get_context("spawn")
+#     with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
+#         future = executor.submit(inference_worker, prompt, negative_prompt, resolution, seed, model_type)
+#         image_bytes = future.result()
+#     from io import BytesIO
+#     from PIL import Image
+#     image = Image.open(BytesIO(image_bytes))
+#     return image
+  
 def gradio_generate(prompt: str, negative_prompt: str, resolution: str, seed: int, model_type: str):
     """
-    Gradio generation function spawns a separate process for inference.
+    Gradio generation function runs inference in the main process.
     """
-    ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
-        future = executor.submit(inference_worker, prompt, negative_prompt, resolution, seed, model_type)
-        image_bytes = future.result()
+    image_bytes = inference_worker(prompt, negative_prompt, resolution, seed, model_type)
     from io import BytesIO
     from PIL import Image
     image = Image.open(BytesIO(image_bytes))
@@ -614,4 +667,7 @@ iface = gr.Interface(
 )
 
 if __name__ == "__main__":
-    iface.launch()
+    if listen:
+        iface.launch(server_name="0.0.0.0", server_port=listen_port)
+    else:
+        iface.launch(server_port=listen_port)
