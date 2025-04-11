@@ -6,3 +6,4 @@ einops>=0.7.0
 accelerate>=1.2.1
 torchao
 bitsandbytes
+gradio
