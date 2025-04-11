@@ -728,7 +728,7 @@ iface = gr.Interface(
     inputs=[
         gr.Textbox(lines=2, label="Prompt", placeholder="Enter your prompt here..."),
         gr.Textbox(lines=2, label="Negative Prompt", placeholder="Optional negative prompt..."),
-        gr.Number(label="Negative Prompt Scale", value=1.0, step=0.05),
+        gr.Number(label="Negative Prompt Scale", value=0.6, step=0.05),
         gr.Textbox(lines=1, label="Resolution", value="1024x1024"),
         gr.Number(label="Seed (-1 for random)", value=-1),
         gr.Dropdown(choices=["dev", "full", "fast"], label="Model Type", value="full")
