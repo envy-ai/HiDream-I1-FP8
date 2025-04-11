@@ -8,6 +8,9 @@ import sys
 import os
 import gc
 import time
+from io import BytesIO
+import json
+from PIL.PngImagePlugin import PngInfo
 from typing import Any, Callable, Dict, List, Optional, Union
 from contextlib import contextmanager
 
@@ -606,12 +609,12 @@ def load_models(model_type, load_transformer, quantize=False):
     logger.info(f"--- Model Loading finished in {time.time() - load_start_time:.2f} seconds ---")
     return pipe, config
 
-# --- Inference Worker Function ---
-def inference_worker(prompt: str, negative_prompt: str, resolution: str, seed: int, model_type: str, progress=None):
+def inference_worker(prompt: str, negative_prompt: str, resolution: str, seed: int, model_type: str):
     """
     Runs inference in a child process so that GPU memory is freed after each request.
     Loads the pipeline, runs image generation, and returns the generated image as PNG bytes.
     """
+    # Determine quantization flag (models must remain on GPU)
     quantize_enabled = torch.cuda.is_available() and TORCHAO_AVAILABLE
     pipe, config = load_models(model_type, load_transformer=False, quantize=quantize_enabled)
     height, width = parse_resolution(resolution)
@@ -621,7 +624,8 @@ def inference_worker(prompt: str, negative_prompt: str, resolution: str, seed: i
     generator_device = "cuda" if torch.cuda.is_available() else "cpu"
     generator = torch.Generator(generator_device).manual_seed(int(seed))
     logger.info(f"[Worker] Running inference with prompt: '{prompt}', seed: {seed}, resolution: ({height}, {width})")
-    # Pass along the progress callback to the pipeline call.
+    
+    # Run the pipeline; pass along the progress callback if provided.
     image_output = pipe(
         prompt=prompt,
         negative_prompt=negative_prompt,
@@ -638,12 +642,27 @@ def inference_worker(prompt: str, negative_prompt: str, resolution: str, seed: i
         return_dict=True,
     )
     image = image_output.images[0]
-    from io import BytesIO
+    
+    # Create metadata dictionary and embed it as JSON in the PNG
+    metadata = {
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "seed": seed,
+        "model": model_type,
+        "llama_model": LLAMA_MODEL_NAME,
+        "resolution": resolution,
+        "timestamp": time_str,
+    }
+    png_info = PngInfo()
+    png_info.add_text("parameters", json.dumps(metadata))
+    
+    # Save image to a BytesIO buffer and also to disk with metadata.
     buf = BytesIO()
-    image.save(buf, format="PNG")
+    image.save(buf, format="PNG", pnginfo=png_info)
     os.makedirs("gradio_output", exist_ok=True)
-    image.save(f"gradio_output/{time_str}_{seed}.png", format="PNG")
+    image.save(f"gradio_output/{time_str}_{seed}.png", format="PNG", pnginfo=png_info)
     return buf.getvalue()
+
   
 def gradio_generate(prompt: str, negative_prompt: str, resolution: str, seed: int, model_type: str):
     """
