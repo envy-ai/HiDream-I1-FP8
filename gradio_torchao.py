@@ -16,6 +16,8 @@ import gradio as gr
 from concurrent.futures import ProcessPoolExecutor
 import multiprocessing
 
+progress = gr.Progress()
+
 # --- Logging configuration ---
 logging.basicConfig(
     level=logging.INFO,
@@ -78,9 +80,11 @@ parser.add_argument("--llama_path", type=str, default="RichardErkhov/NaniDAO_-_M
 parser.add_argument("--quantize_llama", action="store_true", help="Quantize llama when loading, in case you're loading a non-quantized model.")
 parser.add_argument("--listen", action="store_true", help="Open to LAN (run on 0.0.0.0).")
 parser.add_argument("--port", type=int, default=7860, help="Port for Gradio server.")
+parser.add_argument("--negative_prompt_scale", type=float, default=1.0, help="Scale for negative prompt.")
 args = parser.parse_args()
 
 # quantize_enabled depends on both the flag AND successful torchao/TorchAoConfig import
+negative_prompt_scale = args.negative_prompt_scale
 quantize_enabled = True
 quantize_llama = args.quantize_llama
 listen = args.listen
@@ -157,6 +161,7 @@ def parse_resolution(resolution_str):
 
 # --- Pipeline Classes ---
 class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
+    # Added optional progress parameter to __call__
     @torch.no_grad()
     def __call__(self,
                  prompt: Union[str, List[str]] = None,
@@ -184,7 +189,8 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
                  joint_attention_kwargs: Optional[Dict[str, Any]] = None,
                  callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
                  callback_on_step_end_tensor_inputs: List[str] = ["latents"],
-                 max_sequence_length: int = 128):
+                 max_sequence_length: int = 128,
+                 ):
         logger.info("--- Entering Pipeline __call__ ---")
         start_call_time = time.time()
         height = height or self.default_sample_size * self.vae_scale_factor
@@ -226,6 +232,7 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
         final_pooled_prompt_embeds = None
         try:
             logger.info("Encoding prompts...")
+            progress(0, desc="Encoding prompts...")
             prompt_embeds_tuple = self.encode_prompt(
                 prompt=prompt, prompt_2=prompt_2, prompt_3=prompt_3, prompt_4=prompt_4,
                 negative_prompt=negative_prompt, negative_prompt_2=negative_prompt_2,
@@ -253,6 +260,13 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
                 final_prompt_embeds_components = []
                 if negative_prompt_embeds_list is None:
                     raise ValueError("Negative prompt embeddings required for CFG but not provided.")
+
+                # Multiply all negative prompts by negative_prompt_scale
+                if negative_prompt_scale != 1:
+                    negative_prompt_embeds_list = [
+                        n * negative_prompt_scale for n in negative_prompt_embeds_list
+                    ]
+                    
                 for i, (neg, pos) in enumerate(zip(negative_prompt_embeds_list, prompt_embeds_list)):
                     if len(neg.shape) == 4:
                         final_prompt_embeds_components.append(torch.cat([neg, pos], dim=1))
@@ -260,6 +274,7 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
                         final_prompt_embeds_components.append(torch.cat([neg, pos], dim=0))
                     else:
                         raise ValueError(f"Unexpected embedding shape during CFG concat: {neg.shape}")
+                
                 final_prompt_embeds = final_prompt_embeds_components
                 final_pooled_prompt_embeds = torch.cat([negative_pooled_prompt_embeds_out, pooled_prompt_embeds_out], dim=0)
             else:
@@ -283,8 +298,6 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
             time.sleep(5)
 
         # --- Diffusion Phase ---
-        # Get model type from gradio input
-        
         self.transformer = load_models(self.model_type, load_transformer=True,
                                          quantize=True)
         logger.info("--- Starting Diffusion Phase ---")
@@ -298,9 +311,10 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
                 generator, latents,
             )
             latent_dtype = latents.dtype
-            # Aspect ratio embedding (omitted for brevity; same as original logic)
             timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, transformer_device)
-            with self.progress_bar(total=num_inference_steps) as progress_bar:
+            # --- Progress update in diffusion phase ---
+            if progress is not None:
+                # Use the provided Gradio progress callback for updates.
                 for i, t in enumerate(timesteps):
                     latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                     noise_pred = self.transformer(
@@ -318,11 +332,31 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
                     latents = step_output[0]
                     if latents.dtype != latent_dtype:
                         latents = latents.to(latent_dtype)
-                    progress_bar.update()
+                    progress((i + 1) / num_inference_steps, desc=f"Diffusion step {i+1} of {num_inference_steps}")
+            else:
+                with self.progress_bar(total=num_inference_steps) as progress_bar:
+                    for i, t in enumerate(timesteps):
+                        latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                        noise_pred = self.transformer(
+                            hidden_states=latent_model_input,
+                            timesteps=t,
+                            encoder_hidden_states=final_prompt_embeds,
+                            pooled_embeds=final_pooled_prompt_embeds,
+                            return_dict=False,
+                        )[0]
+                        noise_pred = -noise_pred
+                        if do_classifier_free_guidance:
+                            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                            noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                        step_output = self.scheduler.step(noise_pred, t, latents, return_dict=False)
+                        latents = step_output[0]
+                        if latents.dtype != latent_dtype:
+                            latents = latents.to(latent_dtype)
+                        progress_bar.update()
             logger.info(f"Diffusion Phase finished in {time.time() - diffusion_start_time:.2f} seconds.")
             logger.info("--- Starting Decoding Phase ---")
             if output_type != "latent":
-                self.vae.to("cuda" )
+                self.vae.to("cuda")
                 scaling_factor = getattr(self.vae.config, 'scaling_factor', 1.0)
                 shift_factor = getattr(self.vae.config, 'shift_factor', 0.0)
                 latents = (latents / scaling_factor) + shift_factor
@@ -331,7 +365,6 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
                     
                 self.transformer = None
                 logger.info("Transformer unloaded.")
-                # Clear cache, etc
                 logger.info("Clearing CUDA cache...")
                 gc.collect()
                 torch.cuda.empty_cache()
@@ -440,8 +473,7 @@ def load_models(model_type, load_transformer, quantize=False):
         if not TORCHAO_AVAILABLE:
              logger.warning("Quantization requested but torchao/TorchAoConfig unavailable. Skipping quantization for Transformer.")
         else:
-            # Choose FP8 type: 'float8wo_e4m3', 'float8dq_e4m3', etc.
-            fp8_quant_type = "float8wo_e4m3" # Default to weight-only E4M3
+            fp8_quant_type = "float8wo_e4m3"  # Default to weight-only E4M3
             logger.info(f"Defining TorchAoConfig for Transformer quantization type: {fp8_quant_type}")
             try:
                 quantization_config = TorchAoConfig(fp8_quant_type)
@@ -449,12 +481,12 @@ def load_models(model_type, load_transformer, quantize=False):
                 logger.info("TorchAoConfig created successfully for Transformer.")
             except Exception as e:
                  logger.error(f"Failed to create TorchAoConfig: {e}. Disabling quantization for Transformer.", exc_info=True)
-                 quantization_config = None # Ensure it's None if creation fails
-                 global quantize_enabled # Make sure the global flag is updated
-                 quantize_enabled = False # This might need adjustment if only part fails
+                 quantization_config = None
+                 global quantize_enabled
+                 quantize_enabled = False
 
     if not load_transformer:
-        # Load non-transformer models first
+        progress(0, desc="Loading text encoders...")
         logger.info("--- Loading VAE and Text Encoders ---")
         start_time = time.time()
         logger.info("Loading VAE...")
@@ -484,13 +516,8 @@ def load_models(model_type, load_transformer, quantize=False):
         )
         logger.info(f"Text Encoder 3 (T5) loaded in {time.time() - start_time:.2f}s.")
 
-        # Load Llama separately (Transformers quantization is handled differently)
-        # Note: Transformers quantization (like int8) happens during loading if config is passed.
-        # The user script defined `llama_quantization_config` but didn't pass it.
-        # We'll keep it unloaded for now as per the original logic, but log clearly.
         start_time = time.time()
         logger.info(f"Loading Text Encoder 4 (Llama) from {LLAMA_MODEL_NAME} without explicit quantization config...")
-        
         if quantize_llama:
             text_encoder_4 = LlamaForCausalLM.from_pretrained(
                 LLAMA_MODEL_NAME, 
@@ -509,16 +536,17 @@ def load_models(model_type, load_transformer, quantize=False):
                 device_map="auto",
             )
             
-            
     else:
         start_time = time.time()
         logger.info(f"--- Loading Transformer {transformer_quant_status} ---")
+        progress(0, desc="Loading transformer...")
 
         cache_dir = "model_cache"
         os.makedirs(cache_dir, exist_ok=True)
         cache_file = os.path.join(cache_dir, f"transformer_{model_type}.safetensors")
         
         if not os.path.exists(cache_file):
+            progress(0, desc="Cached transformer not found... Downloading and quantizing...")
             logger.info(f"Cached quantized transformer at {cache_file} not found... Loading and quantizing...")
             transformer = HiDreamImageTransformer2DModel.from_pretrained(
                 "HiDream-ai/HiDream-I1-Dev", 
@@ -537,26 +565,22 @@ def load_models(model_type, load_transformer, quantize=False):
         logger.info(f"Transformer loaded in {time.time() - start_time:.2f}s.")
         return transformer
 
-    # --- Scheduler Setup ---
     start_time = time.time()
     logger.info("Initializing Scheduler...")
+    progress(0, desc="Initializing Scheduler...")
     scheduler_class = config["scheduler"]
     scheduler_config_params = {}
     if issubclass(scheduler_class, FlowUniPCMultistepScheduler):
          scheduler_config_params = {"num_train_timesteps": 1000, "shift": config["shift"], "use_dynamic_shifting": False}
          logger.info(f"Configuring {scheduler_class.__name__} with: {scheduler_config_params}")
-    # Add elif for other schedulers if they need specific init args
 
     scheduler = scheduler_class(**scheduler_config_params)
     logger.info(f"Scheduler {scheduler_class.__name__} initialized in {time.time() - start_time:.2f}s.")
 
-
-    # --- Create Pipeline ---
     start_time = time.time()
     logger.info("Initializing HiDreamImagePipelineFP8 (memory-managed pipeline)...")
+    progress(0, desc="Initializing Pipeline...")
     try:
-        # Instantiate the pipeline that handles memory management
-        # All models are passed as CPU objects here.
         pipe = HiDreamImagePipelineDynamicLoad(
             scheduler=scheduler,
             vae=vae,
@@ -571,13 +595,9 @@ def load_models(model_type, load_transformer, quantize=False):
         )
         text_encoder_4 = None
         pipe.model_type = model_type
-        #pipe.transformer = transformer
-        
 
-        # The pipeline's internal device is set, but models remain on CPU
-        #target_device = "cuda" if torch.cuda.is_available() else "cpu"
-        pipe.to("cuda") # This sets pipe._execution_device, doesn't move models yet
-        #logger.info(f"Pipeline initialized. Target execution device set to '{target_device}'. Models remain on CPU until use.")
+        pipe.to("cuda")  # This sets pipe._execution_device, doesn't move models yet
+
         logger.info(f"Pipeline initialized in {time.time() - start_time:.2f}s.")
     except Exception as e:
         logger.error(f"Error initializing pipeline: {e}", exc_info=True)
@@ -585,15 +605,13 @@ def load_models(model_type, load_transformer, quantize=False):
 
     logger.info(f"--- Model Loading finished in {time.time() - load_start_time:.2f} seconds ---")
     return pipe, config
-# --- End Model Loading Function ---
 
 # --- Inference Worker Function ---
-def inference_worker(prompt: str, negative_prompt: str, resolution: str, seed: int, model_type: str):
+def inference_worker(prompt: str, negative_prompt: str, resolution: str, seed: int, model_type: str, progress=None):
     """
     Runs inference in a child process so that GPU memory is freed after each request.
     Loads the pipeline, runs image generation, and returns the generated image as PNG bytes.
     """
-    # Determine quantization flag (models must remain on GPU)
     quantize_enabled = torch.cuda.is_available() and TORCHAO_AVAILABLE
     pipe, config = load_models(model_type, load_transformer=False, quantize=quantize_enabled)
     height, width = parse_resolution(resolution)
@@ -603,6 +621,7 @@ def inference_worker(prompt: str, negative_prompt: str, resolution: str, seed: i
     generator_device = "cuda" if torch.cuda.is_available() else "cpu"
     generator = torch.Generator(generator_device).manual_seed(int(seed))
     logger.info(f"[Worker] Running inference with prompt: '{prompt}', seed: {seed}, resolution: ({height}, {width})")
+    # Pass along the progress callback to the pipeline call.
     image_output = pipe(
         prompt=prompt,
         negative_prompt=negative_prompt,
@@ -616,30 +635,15 @@ def inference_worker(prompt: str, negative_prompt: str, resolution: str, seed: i
         num_images_per_prompt=1,
         generator=generator,
         output_type="pil",
-        return_dict=True
+        return_dict=True,
     )
     image = image_output.images[0]
-    # Convert the image to PNG bytes so it can be returned via multiprocessing
     from io import BytesIO
     buf = BytesIO()
     image.save(buf, format="PNG")
     os.makedirs("gradio_output", exist_ok=True)
     image.save(f"gradio_output/{time_str}_{seed}.png", format="PNG")
     return buf.getvalue()
-
-# --- Gradio Generation Function ---
-# def gradio_generate(prompt: str, negative_prompt: str, resolution: str, seed: int, model_type: str):
-#     """
-#     Gradio generation function spawns a separate process for inference.
-#     """
-#     ctx = multiprocessing.get_context("spawn")
-#     with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
-#         future = executor.submit(inference_worker, prompt, negative_prompt, resolution, seed, model_type)
-#         image_bytes = future.result()
-#     from io import BytesIO
-#     from PIL import Image
-#     image = Image.open(BytesIO(image_bytes))
-#     return image
   
 def gradio_generate(prompt: str, negative_prompt: str, resolution: str, seed: int, model_type: str):
     """
@@ -671,3 +675,4 @@ if __name__ == "__main__":
         iface.launch(server_name="0.0.0.0", server_port=listen_port)
     else:
         iface.launch(server_port=listen_port)
+    logger.info("Gradio interface launched.")
