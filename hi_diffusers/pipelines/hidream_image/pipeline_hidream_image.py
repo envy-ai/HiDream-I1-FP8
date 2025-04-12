@@ -153,11 +153,11 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
         self,
         prompt: Union[str, List[str]] = None,
         num_images_per_prompt: int = 1,
-        max_sequence_length: int = 1024,
+        max_sequence_length: int = 128,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
-        max_sequence_length = self.tokenizer_3.model_max_length
+        #max_sequence_length = self.tokenizer_3.model_max_length
         device = device or self._execution_device
         dtype = dtype or self.text_encoder_3.dtype
 
@@ -240,12 +240,12 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
         self,
         prompt: Union[str, List[str]] = None,
         num_images_per_prompt: int = 1,
-        max_sequence_length: int = 1024,
+        max_sequence_length: int = 128,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):        
         # Let's not arbitrarily restrict this.  We'll let the tokenizer config handle it
-        max_sequence_length = 512
+        #max_sequence_length = 512
         device = device or self._execution_device
         dtype = dtype or self.text_encoder_4.dtype
 

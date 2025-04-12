@@ -239,8 +239,8 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
             progress(0, desc="Encoding prompts...")
             prompt_embeds_tuple = self.encode_prompt(
                 prompt=prompt, prompt_2=prompt_2, prompt_3=prompt_3, prompt_4=prompt_4,
-                negative_prompt=negative_prompt, negative_prompt_2=negative_prompt_2,
-                negative_prompt_3=negative_prompt_3, negative_prompt_4=negative_prompt_4,
+                negative_prompt=negative_prompt, negative_prompt_2=negative_prompt,
+                negative_prompt_3=negative_prompt, negative_prompt_4=negative_prompt,
                 do_classifier_free_guidance=do_classifier_free_guidance,
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
