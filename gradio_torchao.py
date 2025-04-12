@@ -80,6 +80,7 @@ else:
     
 parser = argparse.ArgumentParser(description="Generate images using HiDream with optional FP8 quantization.")
 parser.add_argument("--llama_path", type=str, default="RichardErkhov/NaniDAO_-_Meta-Llama-3.1-8B-Instruct-ablated-v1-8bits", help="Huggingface or local path to the Llama model, ideally INT8 quantized as FP8 will not work. Also try the non-ablated model at fsaudm/Meta-Llama-3.1-8B-Instruct-INT8")
+parser.add_argument("--t5_path", type=str, default="", help="Huggingface or local path to the T5 model.")
 parser.add_argument("--quantize_llama", action="store_true", help="Quantize llama when loading, in case you're loading a non-quantized model.")
 parser.add_argument("--listen", action="store_true", help="Open to LAN (run on 0.0.0.0).")
 parser.add_argument("--port", type=int, default=7860, help="Port for Gradio server.")
@@ -90,6 +91,7 @@ quantize_enabled = True
 quantize_llama = args.quantize_llama
 listen = args.listen
 listen_port = args.port
+t5_path = args.t5_path
 LLAMA_MODEL_NAME = args.llama_path
 
 # --- Global Settings and Model Configurations ---
@@ -503,18 +505,7 @@ def load_models(model_type, load_transformer, quantize=False):
     logger.info(f"--- Starting Model Loading for '{model_type}' from '{pretrained_model_name_or_path}' ---")
     load_start_time = time.time()
 
-    logger.info("Loading tokenizers...")
-    start_time = time.time()
-    tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer")
-    tokenizer_2 = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer_2")
-    tokenizer_3 = T5Tokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer_3")
-    try:
-        tokenizer_4 = PreTrainedTokenizerFast.from_pretrained(LLAMA_MODEL_NAME, use_fast=False)
-        tokenizer_4.pad_token = tokenizer_4.eos_token
-    except OSError:
-        logger.error(f"Cannot find Llama tokenizer files at '{LLAMA_MODEL_NAME}'. Please check the path.")
-        raise
-    logger.info(f"Tokenizers loaded in {time.time() - start_time:.2f}s")
+
 
     dtype = torch.bfloat16
     logger.info(f"Using base dtype: {dtype}")
@@ -539,6 +530,19 @@ def load_models(model_type, load_transformer, quantize=False):
                  quantize_enabled = False
 
     if not load_transformer:
+        logger.info("Loading tokenizers...")
+        start_time = time.time()
+        tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer")
+        tokenizer_2 = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer_2")
+        tokenizer_3 = T5Tokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer_3")
+        try:
+            tokenizer_4 = PreTrainedTokenizerFast.from_pretrained(LLAMA_MODEL_NAME, use_fast=False)
+            tokenizer_4.pad_token = tokenizer_4.eos_token
+        except OSError:
+            logger.error(f"Cannot find Llama tokenizer files at '{LLAMA_MODEL_NAME}'. Please check the path.")
+            raise
+        logger.info(f"Tokenizers loaded in {time.time() - start_time:.2f}s")  
+         
         progress(0, desc="Loading text encoders...")
         logger.info("--- Loading VAE and Text Encoders ---")
         start_time = time.time()
@@ -564,9 +568,14 @@ def load_models(model_type, load_transformer, quantize=False):
 
         start_time = time.time()
         logger.info("Loading Text Encoder 3 (T5)...")
-        text_encoder_3 = T5EncoderModel.from_pretrained(
-            pretrained_model_name_or_path, subfolder="text_encoder_3", torch_dtype=dtype
-        )
+        if t5_path == "":
+            text_encoder_3 = T5EncoderModel.from_pretrained(
+                pretrained_model_name_or_path, subfolder="text_encoder_3", torch_dtype=dtype
+            )
+        else:
+            text_encoder_3 = T5EncoderModel.from_pretrained(
+                t5_path, torch_dtype=dtype
+            )
         logger.info(f"Text Encoder 3 (T5) loaded in {time.time() - start_time:.2f}s.")
 
         start_time = time.time()

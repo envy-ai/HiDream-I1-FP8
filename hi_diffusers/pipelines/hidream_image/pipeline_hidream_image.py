@@ -153,7 +153,7 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
         self,
         prompt: Union[str, List[str]] = None,
         num_images_per_prompt: int = 1,
-        max_sequence_length: int = 128,
+        max_sequence_length: int = 1024,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
@@ -239,7 +239,7 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
         self,
         prompt: Union[str, List[str]] = None,
         num_images_per_prompt: int = 1,
-        max_sequence_length: int = 128,
+        max_sequence_length: int = 1024,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
@@ -302,7 +302,7 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
         pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
-        max_sequence_length: int = 128,
+        max_sequence_length: int = 1024,
         lora_scale: Optional[float] = None,
     ):
         prompt = [prompt] if isinstance(prompt, str) else prompt
@@ -324,7 +324,7 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
             max_sequence_length = max_sequence_length,
         )
 
-        if do_classifier_free_guidance and negative_prompt_embeds is None:
+        if negative_prompt_embeds is None:
             negative_prompt = negative_prompt or ""
             negative_prompt_2 = negative_prompt_2 or negative_prompt
             negative_prompt_3 = negative_prompt_3 or negative_prompt
@@ -379,7 +379,7 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
         num_images_per_prompt: int = 1,
         prompt_embeds: Optional[List[torch.FloatTensor]] = None,
         pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
-        max_sequence_length: int = 128,
+        max_sequence_length: int = 1024,
     ):
         device = device or self._execution_device
         
@@ -536,7 +536,7 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         callback_on_step_end: Optional[Callable[[int, int, Dict], None]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
-        max_sequence_length: int = 128,
+        max_sequence_length: int = 1024,
     ):
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
