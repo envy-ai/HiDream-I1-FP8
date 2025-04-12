@@ -95,7 +95,6 @@ t5_path = args.t5_path
 LLAMA_MODEL_NAME = args.llama_path
 
 # --- Global Settings and Model Configurations ---
-time_str = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
 MODEL_PREFIX = "HiDream-ai"  # Local path prefix or model hub prefix
 MODEL_CONFIGS = {
     "dev": {
@@ -699,6 +698,8 @@ def inference_worker(prompt: str, negative_prompt: str, negative_prompt_scale: f
         return_dict=True,
     )
     image = image_output.images[0]
+    
+    time_str = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     
     # Create metadata dictionary and embed it as JSON in the PNG
     metadata = {
