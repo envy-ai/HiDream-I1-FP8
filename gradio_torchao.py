@@ -8,6 +8,7 @@ import sys
 import os
 import gc
 import time
+import hashlib
 from io import BytesIO
 import json
 from PIL.PngImagePlugin import PngInfo
@@ -40,6 +41,10 @@ except ImportError as e:
 except Exception as e:
     logger.warning(f"Unexpected error during torchao/TorchAoConfig import: {e}")
     TORCHAO_AVAILABLE = False
+
+# Global variable to save transformer between pipeline calls
+# This is a workaround to avoid reloading the transformer model every time.
+cached_tranmsformer = None
 
 # --- Diffusers/Transformers Imports ---
 try:
@@ -84,14 +89,24 @@ parser.add_argument("--t5_path", type=str, default="", help="Huggingface or loca
 parser.add_argument("--quantize_llama", action="store_true", help="Quantize llama when loading, in case you're loading a non-quantized model.")
 parser.add_argument("--listen", action="store_true", help="Open to LAN (run on 0.0.0.0).")
 parser.add_argument("--port", type=int, default=7860, help="Port for Gradio server.")
+# parser.add_argument("--disable_clip", action="store_true", help="EXPERIMENTAL: Send a blank prompt to the CLIP text encoder.")
+# parser.add_argument("--disable_t5", action="store_true", help="EXPERIMENTAL: Send a blank prompt to the T5 text encoder.")
+# parser.add_argument("--disable_llama", action="store_true", help="EXPERIMENTAL: Send a blank prompt to the Llama text encoder.")
+parser.add_argument("--default_seed", type=int, default=-1, help="Default seed for random number generation (defaults to -1, which is random).")
+parser.add_argument("--unload_transformer_before_vae", action="store_true", help="Unload transformer before VAE decoding to save memory.")
 args = parser.parse_args()
 
 # quantize_enabled depends on both the flag AND successful torchao/TorchAoConfig import
+unload_transformer_before_vae = args.unload_transformer_before_vae
 quantize_enabled = True
 quantize_llama = args.quantize_llama
 listen = args.listen
 listen_port = args.port
 t5_path = args.t5_path
+default_seed = args.default_seed
+disable_clip = True
+disable_t5 = True
+disable_llama = False
 LLAMA_MODEL_NAME = args.llama_path
 
 # --- Global Settings and Model Configurations ---
@@ -119,6 +134,69 @@ MODEL_CONFIGS = {
         "scheduler": FlashFlowMatchEulerDiscreteScheduler
     }
 }
+
+# def get_cached_encoding(model, prompt):
+#     """Check if the prompt is already cached to disk."""
+#     cache_dir = "prompt_cache"
+#     os.makedirs(cache_dir, exist_ok=True)
+#     prompt_hash = hash(prompt)
+#     cache_file = os.path.join(cache_dir, f"{model}_{prompt_hash}.json")
+    
+#     if os.path.exists(cache_file):
+#         with open(cache_file, 'r') as f:
+#             cached_encoding = json.load(f)
+#         return cached_encoding
+#     else:
+#         return None
+
+def hash_string(string):
+    if isinstance(string, list):
+        string = string[0]
+    elif isinstance(string, dict):
+        string = json.dumps(string, sort_keys=True)
+    elif isinstance(string, bytes):
+        string = string.decode('utf-8')
+    encoded_string = string.encode('utf-8')
+    hash_object = hashlib.sha256(encoded_string)
+    hex_digest = hash_object.hexdigest()
+    return hex_digest
+
+def get_cached_encoding(model, prompt):
+    """Check if the prompt is already cached to disk."""
+    cache_dir = "prompt_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    prompt_hash = hash_string(prompt)
+    cache_file = os.path.join(cache_dir, f"{model}_{prompt_hash}.pt")
+    print(f"Loading encoding from {cache_file}")
+    
+    if os.path.exists(cache_file):
+        return torch.load(cache_file)
+        # with open(cache_file, 'r') as f:
+        #     # The encoding is a tensor, so load it with torch
+        #     cached_encoding = torch.load(f)
+        #     # Unpickle encoding
+        #     cached_encoding = pickle.loads(cached_encoding).to("cuda")
+        # return cached_encoding
+    else:
+        return None
+
+def cached_encoding_exists(model, prompt):
+    """Check if the prompt is already cached to disk."""
+    cache_dir = "prompt_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # If propmt is a list, join it to create a unique hash
+    if isinstance(prompt, list):
+        prompt = " ".join(prompt)
+    prompt_hash = hash_string(prompt)
+    
+    cache_file = os.path.join(cache_dir, f"{model}_{prompt_hash}.pt")
+    if os.path.exists(cache_file):
+        print(f"Cache file exists: {cache_file}")
+    else:
+        print(f"Cache file does not exist: {cache_file}")
+    return os.path.exists(cache_file)
+
 
 # --- Helper Functions ---
 def calculate_shift(image_seq_len, base_seq_len: int = 256, max_seq_len: int = 4096,
@@ -194,6 +272,7 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
                  callback_on_step_end_tensor_inputs: List[str] = ["latents"],
                  max_sequence_length: int = 128,
                  ):
+        global cached_tranmsformer
         logger.info("--- Entering Pipeline __call__ ---")
         start_call_time = time.time()
         height = height or self.default_sample_size * self.vae_scale_factor
@@ -235,11 +314,13 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
         final_pooled_prompt_embeds = None
         try:
             logger.info("Encoding prompts...")
-            progress(0, desc="Encoding prompts...")
+            logger.info(f"Prompt: {prompt}\nPrompt 2: {prompt_2}\nPrompt 3: {prompt_3}\nPrompt 4: {prompt_4}")
+            logger.info(f"Negative Prompt: {negative_prompt}\nNegative Prompt 2: {negative_prompt_2}\nNegative Prompt 3: {negative_prompt_3}\nNegative Prompt 4: {negative_prompt_4}")
+            
             prompt_embeds_tuple = self.encode_prompt(
                 prompt=prompt, prompt_2=prompt_2, prompt_3=prompt_3, prompt_4=prompt_4,
-                negative_prompt=negative_prompt, negative_prompt_2=negative_prompt,
-                negative_prompt_3=negative_prompt, negative_prompt_4=negative_prompt,
+                negative_prompt=negative_prompt, negative_prompt_2=negative_prompt_2,
+                negative_prompt_3=negative_prompt_3, negative_prompt_4=negative_prompt_4,
                 do_classifier_free_guidance=do_classifier_free_guidance,
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
@@ -351,9 +432,8 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
             torch.cuda.empty_cache()
             time.sleep(5)
 
-        # --- Diffusion Phase ---
-        self.transformer = load_models(self.model_type, load_transformer=True,
-                                         quantize=True)
+        # --- Diffusion Phase ---       
+        self.transformer = load_models(self.model_type, load_transformer=True, quantize=True)
         logger.info("--- Starting Diffusion Phase ---")
         diffusion_start_time = time.time()
         image = None
@@ -417,12 +497,14 @@ class HiDreamImagePipelineFP8(BaseHiDreamImagePipeline):
                 if latents.dtype != self.vae.dtype:
                     latents = latents.to(self.vae.dtype)
                     
-                self.transformer = None
-                logger.info("Transformer unloaded.")
-                logger.info("Clearing CUDA cache...")
-                gc.collect()
-                torch.cuda.empty_cache()
-                torch.cuda.ipc_collect()
+                if unload_transformer_before_vae:
+                    self.transformer = None
+                    cached_tranmsformer = None
+                    logger.info("Transformer unloaded.")
+                    logger.info("Clearing CUDA cache...")
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
                 logger.info(f"CUDA memory allocated after clearing cache: {torch.cuda.memory_allocated(device) / 1e9:.2f} GB")
                 logger.info(f"CUDA memory reserved after clearing cache: {torch.cuda.memory_reserved(device) / 1e9:.2f} GB")
                 image = self.vae.decode(latents, return_dict=False)[0]
@@ -482,6 +564,13 @@ class HiDreamImagePipelineDynamicLoad(HiDreamImagePipelineFP8):
                       max_sequence_length: int = 128, lora_scale: Optional[float] = None):
         if device is None:
             device = self._execution_device
+            
+        # We have an opportunity here to intercept the prompt and cache the embeddings (on a per encoder basis) and hash those prompts
+        # to save time on future calls.
+        
+        # Check if the prompt is already cached to disk
+        
+        
         with self.dynamic_text_encoder_offload(device):
             (prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds,
              negative_pooled_prompt_embeds) = super().encode_prompt(
@@ -497,8 +586,9 @@ class HiDreamImagePipelineDynamicLoad(HiDreamImagePipelineFP8):
              )
         return prompt_embeds, negative_prompt_embeds, pooled_prompt_embeds, negative_pooled_prompt_embeds
 
-def load_models(model_type, load_transformer, quantize=False):
+def load_models(model_type, load_transformer, quantize=False, load_clip=True, load_t5=True, load_llama=True):
     """Loads models, applying quantization via TorchAoConfig if enabled."""
+    global cached_tranmsformer
     config = MODEL_CONFIGS[model_type]
     pretrained_model_name_or_path = config["path"]
     logger.info(f"--- Starting Model Loading for '{model_type}' from '{pretrained_model_name_or_path}' ---")
@@ -529,17 +619,38 @@ def load_models(model_type, load_transformer, quantize=False):
                  quantize_enabled = False
 
     if not load_transformer:
+        if load_t5 or load_llama:
+            cached_transformer = None
+            logger.info("Transformer unloaded.")
+            logger.info("Clearing CUDA cache...")
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+      
         logger.info("Loading tokenizers...")
         start_time = time.time()
-        tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer")
-        tokenizer_2 = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer_2")
-        tokenizer_3 = T5Tokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer_3")
-        try:
-            tokenizer_4 = PreTrainedTokenizerFast.from_pretrained(LLAMA_MODEL_NAME, use_fast=False)
-            tokenizer_4.pad_token = tokenizer_4.eos_token
-        except OSError:
-            logger.error(f"Cannot find Llama tokenizer files at '{LLAMA_MODEL_NAME}'. Please check the path.")
-            raise
+        if load_clip:
+            tokenizer = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer")
+            tokenizer_2 = CLIPTokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer_2")
+        else:
+            tokenizer = None
+            tokenizer_2 = None
+            
+        if load_t5:
+            tokenizer_3 = T5Tokenizer.from_pretrained(pretrained_model_name_or_path, subfolder="tokenizer_3")
+        else:
+            tokenizer_3 = None
+            
+        if load_llama:
+            try:
+                tokenizer_4 = PreTrainedTokenizerFast.from_pretrained(LLAMA_MODEL_NAME, use_fast=False)
+                tokenizer_4.pad_token = tokenizer_4.eos_token
+            except OSError:
+                logger.error(f"Cannot find Llama tokenizer files at '{LLAMA_MODEL_NAME}'. Please check the path.")
+                raise
+        else:
+            tokenizer_4 = None
+            
         logger.info(f"Tokenizers loaded in {time.time() - start_time:.2f}s")  
          
         progress(0, desc="Loading text encoders...")
@@ -551,51 +662,61 @@ def load_models(model_type, load_transformer, quantize=False):
         )
         logger.info(f"VAE loaded in {time.time() - start_time:.2f}s.")
 
-        start_time = time.time()
-        logger.info("Loading Text Encoder 1 (CLIP)...")
-        text_encoder = CLIPTextModelWithProjection.from_pretrained(
-            pretrained_model_name_or_path, subfolder="text_encoder", torch_dtype=dtype
-        )
-        logger.info(f"Text Encoder 1 (CLIP) loaded in {time.time() - start_time:.2f}s.")
-
-        start_time = time.time()
-        logger.info("Loading Text Encoder 2 (CLIP)...")
-        text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
-            pretrained_model_name_or_path, subfolder="text_encoder_2", torch_dtype=dtype
-        )
-        logger.info(f"Text Encoder 2 (CLIP) loaded in {time.time() - start_time:.2f}s.")
-
-        start_time = time.time()
-        logger.info("Loading Text Encoder 3 (T5)...")
-        if t5_path == "":
-            text_encoder_3 = T5EncoderModel.from_pretrained(
-                pretrained_model_name_or_path, subfolder="text_encoder_3", torch_dtype=dtype
+        if load_clip:
+            start_time = time.time()
+            logger.info("Loading Text Encoder 1 (CLIP)...")
+            text_encoder = CLIPTextModelWithProjection.from_pretrained(
+                pretrained_model_name_or_path, subfolder="text_encoder", torch_dtype=dtype
             )
+            logger.info(f"Text Encoder 1 (CLIP) loaded in {time.time() - start_time:.2f}s.")
+
+            start_time = time.time()
+            logger.info("Loading Text Encoder 2 (CLIP)...")
+            text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
+                pretrained_model_name_or_path, subfolder="text_encoder_2", torch_dtype=dtype
+            )
+            logger.info(f"Text Encoder 2 (CLIP) loaded in {time.time() - start_time:.2f}s.")
         else:
-            text_encoder_3 = T5EncoderModel.from_pretrained(
-                t5_path, torch_dtype=dtype
-            )
-        logger.info(f"Text Encoder 3 (T5) loaded in {time.time() - start_time:.2f}s.")
+            text_encoder = None
+            text_encoder_2 = None
 
-        start_time = time.time()
-        logger.info(f"Loading Text Encoder 4 (Llama) from {LLAMA_MODEL_NAME} without explicit quantization config...")
-        if quantize_llama:
-            text_encoder_4 = LlamaForCausalLM.from_pretrained(
-                LLAMA_MODEL_NAME, 
-                output_hidden_states=True,
-                output_attentions=True,
-                torch_dtype=dtype,
-                device_map="auto",
-                load_in_8bit=True, 
-            )
+        if load_t5:
+            start_time = time.time()
+            logger.info("Loading Text Encoder 3 (T5)...")
+            if t5_path == "":
+                text_encoder_3 = T5EncoderModel.from_pretrained(
+                    pretrained_model_name_or_path, subfolder="text_encoder_3", torch_dtype=dtype
+                )
+            else:
+                text_encoder_3 = T5EncoderModel.from_pretrained(
+                    t5_path, torch_dtype=dtype
+                )
+            logger.info(f"Text Encoder 3 (T5) loaded in {time.time() - start_time:.2f}s.")
         else:
-            text_encoder_4 = LlamaForCausalLM.from_pretrained(
-                LLAMA_MODEL_NAME, 
-                output_hidden_states=True,
-                output_attentions=True,
-                torch_dtype=dtype,
-                device_map="auto",
-            )
+            text_encoder_3 = None
+
+        if load_llama:
+            start_time = time.time()
+            logger.info(f"Loading Text Encoder 4 (Llama) from {LLAMA_MODEL_NAME} without explicit quantization config...")
+            if quantize_llama:
+                text_encoder_4 = LlamaForCausalLM.from_pretrained(
+                    LLAMA_MODEL_NAME, 
+                    output_hidden_states=True,
+                    output_attentions=True,
+                    torch_dtype=dtype,
+                    device_map="auto",
+                    load_in_8bit=True, 
+                )
+            else:
+                text_encoder_4 = LlamaForCausalLM.from_pretrained(
+                    LLAMA_MODEL_NAME, 
+                    output_hidden_states=True,
+                    output_attentions=True,
+                    torch_dtype=dtype,
+                    device_map="auto",
+                )
+        else:
+            text_encoder_4 = None
             
     else:
         start_time = time.time()
@@ -624,6 +745,7 @@ def load_models(model_type, load_transformer, quantize=False):
                 transformer.load_state_dict(state_dict, assign=True)
 
         logger.info(f"Transformer loaded in {time.time() - start_time:.2f}s.")
+        cached_transformer = transformer
         return transformer
 
     start_time = time.time()
@@ -673,8 +795,49 @@ def inference_worker(prompt: str, negative_prompt: str, negative_prompt_scale: f
     Loads the pipeline, runs image generation, and returns the generated image as PNG bytes.
     """
     # Determine quantization flag (models must remain on GPU)
+    metadata_prompt = prompt
+    metadata_negative_prompt = negative_prompt
     quantize_enabled = torch.cuda.is_available() and TORCHAO_AVAILABLE
-    pipe, config = load_models(model_type, load_transformer=False, quantize=quantize_enabled)
+
+    progress(0, desc="Encoding prompts...")
+    
+    prompt_2 = prompt
+    prompt_3 = prompt
+    prompt_4 = prompt
+    negative_prompt_2 = negative_prompt
+    negative_prompt_3 = negative_prompt
+    negative_prompt_4 = negative_prompt
+    load_clip = True
+    load_t5 = True
+    load_llama = True
+    
+    if disable_clip:
+        logger.info("Disabling CLIP text encoder...")
+        prompt = ""
+        prompt_2 = ""
+        negative_prompt = ""
+        negative_prompt_2 = ""
+
+    if disable_t5:
+        logger.info("Disabling T5 text encoder...")
+        prompt_3 = ""
+        negative_prompt_3 = ""
+
+    if disable_llama:
+        logger.info("Disabling Llama text encoder...")
+        prompt_4 = ""
+        negative_prompt_4 = ""
+
+    if cached_encoding_exists("clip1", prompt) and cached_encoding_exists("clip2", prompt_2) and cached_encoding_exists("clip1", negative_prompt) and cached_encoding_exists("clip2", negative_prompt_2):
+        load_clip = False
+        
+    if cached_encoding_exists("t5", prompt_3) and cached_encoding_exists("t5", negative_prompt_3):
+        load_t5 = False
+        
+    if cached_encoding_exists("llama", prompt_4) and cached_encoding_exists("llama", negative_prompt_4):
+        load_llama = False
+    
+    pipe, config = load_models(model_type, load_transformer=False, quantize=quantize_enabled, load_clip=load_clip, load_t5=load_t5, load_llama=load_llama)
     height, width = parse_resolution(resolution)
     if seed == -1:
         seed = torch.randint(0, 2**32 - 1, (1,)).item()
@@ -686,7 +849,13 @@ def inference_worker(prompt: str, negative_prompt: str, negative_prompt_scale: f
     # Run the pipeline; pass along the progress callback if provided.
     image_output = pipe(
         prompt=prompt,
+        prompt_2=prompt_2,
+        prompt_3=prompt_3,
+        prompt_4=prompt_4,
         negative_prompt=negative_prompt,
+        negative_prompt_2=negative_prompt_2,
+        negative_prompt_3=negative_prompt_3,
+        negative_prompt_4=negative_prompt_4,
         negative_prompt_scale=negative_prompt_scale,
         height=height,
         width=width,
@@ -703,8 +872,8 @@ def inference_worker(prompt: str, negative_prompt: str, negative_prompt_scale: f
     
     # Create metadata dictionary and embed it as JSON in the PNG
     metadata = {
-        "prompt": prompt,
-        "negative_prompt": negative_prompt,
+        "prompt": metadata_prompt,
+        "negative_prompt": metadata_negative_prompt,
         "seed": seed,
         "model": model_type,
         "llama_model": LLAMA_MODEL_NAME,
@@ -722,10 +891,14 @@ def inference_worker(prompt: str, negative_prompt: str, negative_prompt_scale: f
     return buf.getvalue()
 
   
-def gradio_generate(prompt: str, negative_prompt: str, negative_prompt_scale: float, resolution: str, seed: int, model_type: str):
+def gradio_generate(prompt: str, negative_prompt: str, negative_prompt_scale: float, resolution: str, seed: int, model_type: str, gen_disable_clip: bool, gen_disable_t5: bool, gen_disable_llama: bool):
     """
     Gradio generation function runs inference in the main process.
     """
+    global disable_clip, disable_t5, disable_llama
+    disable_clip = gen_disable_clip
+    disable_t5 = gen_disable_t5
+    disable_llama = gen_disable_llama
     image_bytes = inference_worker(prompt, negative_prompt, negative_prompt_scale, resolution, seed, model_type)
     from io import BytesIO
     from PIL import Image
@@ -740,8 +913,12 @@ iface = gr.Interface(
         gr.Textbox(lines=2, label="Negative Prompt", placeholder="Optional negative prompt..."),
         gr.Number(label="Negative Prompt Scale", value=0.6, step=0.05),
         gr.Textbox(lines=1, label="Resolution", value="1024x1024"),
-        gr.Number(label="Seed (-1 for random)", value=-1),
-        gr.Dropdown(choices=["dev", "full", "fast"], label="Model Type", value="full")
+        gr.Number(label="Seed (-1 for random)", value=default_seed),
+        gr.Dropdown(choices=["dev", "full", "fast"], label="Model Type", value="full"),
+        # Checkboxes for disabling CLIP and T5
+        gr.Checkbox(label="Disable CLIP Text Encoder", value=True),
+        gr.Checkbox(label="Disable T5 Text Encoder", value=True),
+        gr.Checkbox(label="Disable Llama Text Encoder", value=False),
     ],
     outputs=gr.Image(label="Generated Image"),
     title="HiDream Image Generator",

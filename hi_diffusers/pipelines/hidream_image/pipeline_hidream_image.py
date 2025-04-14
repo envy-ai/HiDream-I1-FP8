@@ -3,6 +3,10 @@ from typing import Any, Callable, Dict, List, Optional, Union
 import math
 import einops
 import torch
+import pickle
+import json
+import os
+import hashlib
 from transformers import (
     CLIPTextModelWithProjection,
     CLIPTokenizer,
@@ -35,6 +39,68 @@ else:
     XLA_AVAILABLE = False
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+def hash_string(string):
+    if isinstance(string, list):
+        string = string[0]
+    elif isinstance(string, dict):
+        string = json.dumps(string, sort_keys=True)
+    elif isinstance(string, bytes):
+        string = string.decode('utf-8')
+    encoded_string = string.encode('utf-8')
+    hash_object = hashlib.sha256(encoded_string)
+    hex_digest = hash_object.hexdigest()
+    return hex_digest
+
+def get_cached_encoding(model, prompt):
+    """Check if the prompt is already cached to disk."""
+    cache_dir = "prompt_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    prompt_hash = hash_string(prompt)
+    cache_file = os.path.join(cache_dir, f"{model}_{prompt_hash}.pt")
+    print(f"Loading encoding from {cache_file}")
+    
+    if os.path.exists(cache_file):
+        return torch.load(cache_file)
+        # with open(cache_file, 'r') as f:
+        #     # The encoding is a tensor, so load it with torch
+        #     cached_encoding = torch.load(f)
+        #     # Unpickle encoding
+        #     cached_encoding = pickle.loads(cached_encoding).to("cuda")
+        # return cached_encoding
+    else:
+        return None
+
+def cached_encoding_exists(model, prompt):
+    """Check if the prompt is already cached to disk."""
+    cache_dir = "prompt_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    # If propmt is a list, join it to create a unique hash
+    if isinstance(prompt, list):
+        prompt = " ".join(prompt)
+    prompt_hash = hash_string(prompt)
+    
+    cache_file = os.path.join(cache_dir, f"{model}_{prompt_hash}.pt")
+    
+    return os.path.exists(cache_file)
+
+def save_cached_encoding(model, prompt, encoding):
+    """Save the prompt encoding to disk."""
+    cache_dir = "prompt_cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    # If propmt is a list, join it to create a unique hash
+    if isinstance(prompt, list):
+        prompt = " ".join(prompt)
+    prompt_hash = hash_string(prompt)
+    cache_file = os.path.join(cache_dir, f"{model}_{prompt_hash}.pt")
+    
+    #pickle = pickle.dumps(encoding)
+    
+    #with open(cache_file, 'w') as f:
+        # The encoding is a tensor, so save it with torch.save
+    print(f"Saving encoding to {cache_file}")
+    torch.save(encoding, cache_file)
 
 # Copied from diffusers.pipelines.flux.pipeline_flux.calculate_shift
 def calculate_shift(
@@ -147,7 +213,9 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
         # by the patch size. So the vae scale factor is multiplied by the patch size to account for this
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2)
         self.default_sample_size = 128
-        self.tokenizer_4.pad_token = self.tokenizer_4.eos_token
+        
+        if self.tokenizer_4 is not None:
+            self.tokenizer_4.pad_token = self.tokenizer_4.eos_token
 
     def _get_t5_prompt_embeds(
         self,
@@ -314,6 +382,15 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
         else:
             batch_size = prompt_embeds.shape[0]
 
+        print(
+            f"encode_prompt: prompt: {prompt}, prompt_2: {prompt_2}, prompt_3: {prompt_3}, prompt_4: {prompt_4}, "
+            f"negative_prompt: {negative_prompt}, negative_prompt_2: {negative_prompt_2}, "
+            f"negative_prompt_3: {negative_prompt_3}, negative_prompt_4: {negative_prompt_4}, "
+            f"batch_size: {batch_size}, do_classifier_free_guidance: {do_classifier_free_guidance}, "
+            f"num_images_per_prompt: {num_images_per_prompt}, max_sequence_length: {max_sequence_length}, "
+            f"lora_scale: {lora_scale}"
+        )
+
         prompt_embeds, pooled_prompt_embeds = self._encode_prompt(
             prompt = prompt,
             prompt_2 = prompt_2,
@@ -396,42 +473,59 @@ class HiDreamImagePipeline(DiffusionPipeline, FromSingleFileMixin):
             prompt_4 = prompt_4 or prompt
             prompt_4 = [prompt_4] if isinstance(prompt_4, str) else prompt_4
 
-            pooled_prompt_embeds_1 = self._get_clip_prompt_embeds(
-                self.tokenizer,
-                self.text_encoder,
-                prompt = prompt,
-                num_images_per_prompt = num_images_per_prompt,
-                max_sequence_length = max_sequence_length,
-                device = device,
-                dtype = dtype,
-            )
+            if cached_encoding_exists("clip1", prompt):
+                pooled_prompt_embeds_1 = get_cached_encoding("clip1", prompt)
+            else:                 
+                pooled_prompt_embeds_1 = self._get_clip_prompt_embeds(
+                    self.tokenizer,
+                    self.text_encoder,
+                    prompt = prompt,
+                    num_images_per_prompt = num_images_per_prompt,
+                    max_sequence_length = max_sequence_length,
+                    device = device,
+                    dtype = dtype,
+                )
+                save_cached_encoding("clip1", prompt, pooled_prompt_embeds_1)
 
-            pooled_prompt_embeds_2 = self._get_clip_prompt_embeds(
-                self.tokenizer_2,
-                self.text_encoder_2,
-                prompt = prompt_2,
-                num_images_per_prompt = num_images_per_prompt,
-                max_sequence_length = max_sequence_length,
-                device = device,
-                dtype = dtype,
-            )
+            if cached_encoding_exists("clip2", prompt_2):
+                pooled_prompt_embeds_2 = get_cached_encoding("clip2", prompt_2)
+            else:
+                pooled_prompt_embeds_2 = self._get_clip_prompt_embeds(
+                    self.tokenizer_2,
+                    self.text_encoder_2,
+                    prompt = prompt_2,
+                    num_images_per_prompt = num_images_per_prompt,
+                    max_sequence_length = max_sequence_length,
+                    device = device,
+                    dtype = dtype,
+                )
+                save_cached_encoding("clip2", prompt_2, pooled_prompt_embeds_2)
 
             pooled_prompt_embeds = torch.cat([pooled_prompt_embeds_1, pooled_prompt_embeds_2], dim=-1)
 
-            t5_prompt_embeds = self._get_t5_prompt_embeds(
-                prompt = prompt_3,
-                num_images_per_prompt = num_images_per_prompt,
-                max_sequence_length = max_sequence_length,
-                device = device,
-                dtype = dtype
-            )
-            llama3_prompt_embeds = self._get_llama3_prompt_embeds(
-                prompt = prompt_4,
-                num_images_per_prompt = num_images_per_prompt,
-                max_sequence_length = max_sequence_length,
-                device = device,
-                dtype = dtype
-            )
+            if cached_encoding_exists("t5", prompt_3):
+                t5_prompt_embeds = get_cached_encoding("t5", prompt_3)
+            else:
+                t5_prompt_embeds = self._get_t5_prompt_embeds(
+                    prompt = prompt_3,
+                    num_images_per_prompt = num_images_per_prompt,
+                    max_sequence_length = max_sequence_length,
+                    device = device,
+                    dtype = dtype
+                )
+                save_cached_encoding("t5", prompt_3, t5_prompt_embeds)
+                
+            if cached_encoding_exists("llama", prompt_4):
+                llama3_prompt_embeds = get_cached_encoding("llama", prompt_4)
+            else:
+                llama3_prompt_embeds = self._get_llama3_prompt_embeds(
+                    prompt = prompt_4,
+                    num_images_per_prompt = num_images_per_prompt,
+                    max_sequence_length = max_sequence_length,
+                    device = device,
+                    dtype = dtype
+                )
+                save_cached_encoding("llama", prompt_4, llama3_prompt_embeds)
             prompt_embeds = [t5_prompt_embeds, llama3_prompt_embeds]
 
         return prompt_embeds, pooled_prompt_embeds
